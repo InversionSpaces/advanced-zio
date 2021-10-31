@@ -24,6 +24,8 @@ import zio.stm._
 import zio.test._
 import zio.test.TestAspect._
 import zio.test.environment.Live
+import zio.test.Assertion._
+import zio.test.environment.TestClock
 
 /**
  * ZIO queues are high-performance, asynchronous, lock-free structures backed
@@ -48,10 +50,14 @@ object QueueBasics extends DefaultRunnableSpec {
        */
       test("offer/take") {
         for {
-          ref <- Ref.make(0)
-          v   <- ref.get
+          ref   <- Ref.make(0)
+          queue <- Queue.bounded[Int](1)
+          offer = queue.offer(12)
+          take  = queue.take.flatMap(ref.set)
+          _     <- offer race take
+          v     <- ref.get
         } yield assertTrue(v == 12)
-      } @@ ignore +
+      } +
         /**
          * EXERCISE
          *
@@ -63,9 +69,10 @@ object QueueBasics extends DefaultRunnableSpec {
             counter <- Ref.make(0)
             queue   <- Queue.bounded[Int](100)
             _       <- ZIO.foreach(1 to 100)(v => queue.offer(v)).forkDaemon
+            _       <- ZIO.foreach(1 to 100)(_ => queue.take.flatMap(i => counter.update(_ + i)))
             value   <- counter.get
           } yield assertTrue(value == 5050)
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -77,11 +84,11 @@ object QueueBasics extends DefaultRunnableSpec {
           for {
             counter <- Ref.make(0)
             queue   <- Queue.bounded[Int](100)
-            _       <- ZIO.foreach(1 to 100)(v => queue.offer(v)).forkDaemon
+            _       <- ZIO.foreachPar(1 to 100)(v => queue.offer(v)).forkDaemon
             _       <- queue.take.flatMap(v => counter.update(_ + v)).repeatN(99)
             value   <- counter.get
           } yield assertTrue(value == 5050)
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -93,10 +100,10 @@ object QueueBasics extends DefaultRunnableSpec {
             counter <- Ref.make(0)
             queue   <- Queue.bounded[Int](100)
             _       <- ZIO.foreachPar(1 to 100)(v => queue.offer(v)).forkDaemon
-            _       <- queue.take.flatMap(v => counter.update(_ + v)).repeatN(99)
+            _       <- ZIO.foreachPar(1 to 100)(_ => queue.take.flatMap(v => counter.update(_ + v)))
             value   <- counter.get
           } yield assertTrue(value == 5050)
-        } @@ ignore +
+        } +
         /**
          * EXERCISE
          *
@@ -111,9 +118,10 @@ object QueueBasics extends DefaultRunnableSpec {
             _      <- (latch.succeed(()) *> queue.offer(1).forever).ensuring(done.set(true)).fork
             _      <- latch.await
             _      <- queue.takeN(100)
+            _      <- queue.shutdown
             isDone <- done.get.repeatWhile(_ == false).timeout(10.millis).some
           } yield assertTrue(isDone)
-        } @@ ignore
+        }
     }
 }
 
@@ -134,8 +142,9 @@ object StmBasics extends DefaultRunnableSpec {
          * Implement a simple concurrent latch.
          */
         final case class Latch(ref: TRef[Boolean]) {
-          def await: UIO[Any]   = UIO.unit
-          def trigger: UIO[Any] = UIO.unit
+          // FIXME Isn't it active sleeping?
+          def await: UIO[Any]   = ref.get.flatMap(STM.check(_)).commit
+          def trigger: UIO[Any] = ref.set(true).commit
         }
 
         def makeLatch: UIO[Latch] = TRef.make(false).map(Latch(_)).commit
@@ -149,7 +158,7 @@ object StmBasics extends DefaultRunnableSpec {
           _      <- Live.live(Clock.sleep(10.millis))
           second <- waiter.poll
         } yield assertTrue(first.isEmpty && second.isDefined)
-      } @@ ignore +
+      } +
         test("countdown latch") {
 
           /**
@@ -158,8 +167,8 @@ object StmBasics extends DefaultRunnableSpec {
            * Implement a simple concurrent latch.
            */
           final case class CountdownLatch(ref: TRef[Int]) {
-            def await: UIO[Any]     = UIO.unit
-            def countdown: UIO[Any] = UIO.unit
+            def await: UIO[Any]     = ref.get.flatMap(v => STM.check(v == 0)).commit
+            def countdown: UIO[Any] = ref.update(_ - 1).commit
           }
 
           def makeLatch(n: Int): UIO[CountdownLatch] = TRef.make(n).map(ref => CountdownLatch(ref)).commit
@@ -174,7 +183,7 @@ object StmBasics extends DefaultRunnableSpec {
             _      <- Live.live(Clock.sleep(10.millis))
             second <- waiter.poll
           } yield assertTrue(first.isEmpty && second.isDefined)
-        } @@ ignore +
+        } +
         test("permits") {
 
           /**
@@ -183,9 +192,14 @@ object StmBasics extends DefaultRunnableSpec {
            * Implement `acquire` and `release` in a fashion the test passes.
            */
           final case class Permits(ref: TRef[Int]) {
-            def acquire(howMany: Int): UIO[Unit] = ???
+            def acquire(howMany: Int): UIO[Unit] =
+              ref.get.flatMap {
+                case v if v >= howMany => ref.set(v - howMany)
+                case _                 => STM.retry
+              }.commit
 
-            def release(howMany: Int): UIO[Unit] = ???
+            def release(howMany: Int): UIO[Unit] =
+              ref.update(_ + howMany).commit
           }
 
           def makePermits(max: Int): UIO[Permits] = TRef.make(max).map(Permits(_)).commit
@@ -193,8 +207,8 @@ object StmBasics extends DefaultRunnableSpec {
           for {
             counter <- Ref.make(0)
             permits <- makePermits(100)
-            _ <- ZIO.foreachPar(1 to 1000)(
-                  _ => Random.nextIntBetween(1, 2).flatMap(n => permits.acquire(n) *> permits.release(n))
+            _ <- ZIO.foreachPar(1 to 1000)(_ =>
+                  Random.nextIntBetween(1, 2).flatMap(n => permits.acquire(n) *> permits.release(n))
                 )
             latch   <- Promise.make[Nothing, Unit]
             fiber   <- (latch.succeed(()) *> permits.acquire(101) *> counter.set(1)).forkDaemon
@@ -204,7 +218,7 @@ object StmBasics extends DefaultRunnableSpec {
             count   <- counter.get
             permits <- permits.ref.get.commit
           } yield assertTrue(count == 0 && permits == 100)
-        } @@ ignore
+        }
     }
 }
 
@@ -233,14 +247,18 @@ object HubBasics extends DefaultRunnableSpec {
           latch   <- TRef.make(100).commit
           scount  <- Ref.make[Int](0)
           _       <- (latch.get.retryUntil(_ <= 0).commit *> ZIO.foreach(1 to 100)(hub.publish(_))).forkDaemon
-          _ <- ZIO.foreachPar(1 to 100) { _ =>
-                hub.subscribe.use { queue =>
-                  latch.update(_ - 1).commit
-                }
-              }
+          _ <- ZIO.foreachPar(1 to 100)(_ =>
+                hub.subscribe.use(queue =>
+                  for {
+                    _      <- latch.update(_ - 1).commit
+                    values <- queue.takeN(100)
+                    _      <- counter.update(_ + values.sum)
+                  } yield ()
+                )
+              )
           value <- counter.get
         } yield assertTrue(value == 505000)
-      } @@ ignore
+      }
     }
 }
 
@@ -257,6 +275,153 @@ object HubBasics extends DefaultRunnableSpec {
  *    which (gradually?) resets after a certain amount of time.
  */
 object Graduation extends DefaultRunnableSpec {
+  final case class CircuitBreaker(
+    config: CircuitBreaker.Config,
+    clock: Clock,
+    counter: TRef[Int],
+    state: TRef[CircuitBreaker.State]
+  ) {
+    import CircuitBreaker.State._
+
+    private lazy val onSuccess: UIO[Unit] = state.get.flatMap {
+      case Closed => STM.unit // ignore
+      case Open   => counter.set(0)
+      case HalfOpen =>
+        counter.updateAndGet(_ + 1).flatMap {
+          case value if value == config.successThreshold =>
+            counter.set(0) *> state.set(Open)
+          case _ => STM.unit
+        }
+    }.commit
+
+    private lazy val scheduleHalfOpen: UIO[Unit] =
+      (clock.sleep(config.timeout) *> state.set(HalfOpen).commit).forkDaemon.unit
+
+    private lazy val onFailure: UIO[Unit] = state.get.flatMap {
+      case Closed => STM.succeed(false)
+      case HalfOpen =>
+        counter.set(0) *> state.set(Closed) *> STM.succeed(true)
+      case Open =>
+        counter.updateAndGet(_ + 1).flatMap {
+          case value if value == config.failureThreshold =>
+            counter.set(0) *> state.set(Closed) *> STM.succeed(true)
+          case _ => STM.succeed(false)
+        }
+    }.commit.flatMap(scheduleHalfOpen.when(_))
+
+    def attempt[E, A](zio: IO[E, A])(rejected: IO[E, A]): IO[E, A] =
+      state.get.commit.flatMap {
+        case Closed => rejected
+        case HalfOpen | Open =>
+          zio.tapBoth(
+            _ => onFailure,
+            _ => onSuccess
+          )
+      }
+  }
+
+  object CircuitBreaker extends Accessible[CircuitBreaker] {
+    final case class Config(
+      successThreshold: Int,
+      failureThreshold: Int,
+      timeout: Duration
+    )
+
+    def attempt[E, A](zio: IO[E, A])(rejected: IO[E, A]): ZIO[Has[CircuitBreaker], E, A] =
+      CircuitBreaker(_.attempt(zio)(rejected))
+
+    sealed trait State extends Product with Serializable
+    object State {
+      final case object Open     extends State
+      final case object HalfOpen extends State
+      final case object Closed   extends State
+    }
+  }
+
+  val successThreshold = 3
+  val failureThreshold = 5
+  val timeout          = Duration.fromMillis(100)
+  lazy val testCircuitBreaker: ZLayer[Has[Clock], Nothing, Has[CircuitBreaker]] =
+    (for {
+      clock   <- ZIO.service[Clock]
+      counter <- TRef.make[Int](0).commit
+      state   <- TRef.make[CircuitBreaker.State](CircuitBreaker.State.Open).commit
+      config = CircuitBreaker.Config(
+        successThreshold,
+        failureThreshold,
+        timeout
+      )
+    } yield CircuitBreaker(config, clock, counter, state)).toLayer
+
   def spec =
-    suite("Graduation")()
+    suite("CircuitBreaker") {
+      sealed trait Error
+      final case class Domain(msg: String) extends Error
+      final case object Rejected           extends Error
+
+      val succeed = CircuitBreaker.attempt(
+        ZIO.succeed(())
+      )(ZIO.fail(Rejected))
+
+      val fail = CircuitBreaker
+        .attempt[Error, Unit](
+          ZIO.fail(Domain("Fail"))
+        )(ZIO.fail(Rejected))
+        .catchSome {
+          case Domain("Fail") => ZIO.succeed()
+        }
+
+      val batchSuccess = ZIO.foreachPar(1 to 1000)(_ => succeed)
+
+      val makeClosed = ZIO
+        .foreachPar(1 to failureThreshold)(_ =>
+          CircuitBreaker.attempt[Error, Unit](
+            ZIO.fail(Domain("Make Closed"))
+          )(ZIO.fail(Domain("Rejected on Make Closed")))
+        )
+        .catchSome {
+          case Domain("Make Closed") => ZIO.succeed(())
+        }
+
+      val makeOpen = ZIO
+        .foreachPar(1 to successThreshold)(_ => succeed)
+
+      val waitHalfOpen = TestClock.adjust(timeout)
+
+      val waitAndFail = waitHalfOpen *> fail
+
+      test("bypass") {
+        assertM(batchSuccess.exit)(succeeds(anything))
+      } + test("reject") {
+        val program = for {
+          _ <- makeClosed
+          _ <- succeed
+        } yield ()
+
+        assertM(program.exit)(fails(equalTo(Rejected)))
+      } + test("half open") {
+        val program = for {
+          _    <- makeClosed
+          rand <- Random.nextIntBetween(1, 100)
+          _    <- waitAndFail.repeatN(rand - 1)
+          _    <- waitHalfOpen
+          _    <- batchSuccess
+        } yield ()
+
+        assertM(program.exit)(succeeds(anything))
+      } + test("open") {
+        val program = for {
+          _    <- makeClosed
+          rand <- Random.nextIntBetween(1, 100)
+          _    <- waitAndFail.repeatN(rand - 1)
+          _    <- waitHalfOpen
+          _    <- makeOpen
+          rand <- Random.nextIntBetween(0, failureThreshold - 1)
+          _    <- fail.repeatN(rand - 1)
+          _    <- batchSuccess
+        } yield ()
+
+        assertM(program.exit)(succeeds(anything))
+      }
+    }.provideCustomLayer(testCircuitBreaker)
 }
